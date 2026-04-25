@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Training artifacts
+outputs/
+worldmodelgnn/
+wandb/
+*.ckpt
+
+# Datasets (large binaries)
+*.h5
+*.h5.zst
+
+# Auto-generated environment snapshots
+environment.json
+environment_v*.json
+requirements_frozen.txt
+requirements_frozen_v*.txt
