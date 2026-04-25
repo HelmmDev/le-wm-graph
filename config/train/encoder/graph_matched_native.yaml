@@ -1,0 +1,8 @@
+# Graph encoder, matched-capacity, native width:
+# - "matched" capacity targets parameter-parity with flat_vit (tiny).
+# - "native" width: predictor operates on N_max * d_obj features (no projection).
+type: graph
+capacity: matched
+width_mode: native
+d_obj: 192
+n_max: 8

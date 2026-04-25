@@ -1,0 +1,19 @@
+# LeWM graph-encoder variant config.
+#
+# Inherits the baseline (lewm.yaml) and:
+#  - swaps the data group to bouncing_balls (override with `data=pusht` etc.)
+#  - selects a graph encoder variant (override with `encoder=...`)
+#
+# `wm.embed_dim` is resolved at runtime by train.py based on the chosen
+# encoder variant: native -> d_obj * n_max, projected -> d_obj.
+defaults:
+  - lewm                                # inherit baseline
+  - encoder: graph_matched_native       # one of the encoder/* variants
+  - override /data: bouncing_balls      # default to bouncing balls
+  - _self_
+
+# Override embed_dim because graph encoder produces N x D_obj
+wm:
+  embed_dim: ???                        # set per encoder variant; resolved at runtime
+
+output_model_name: lewm_graph

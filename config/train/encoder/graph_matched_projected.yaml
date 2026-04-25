@@ -1,0 +1,8 @@
+# Graph encoder, matched-capacity, projected width:
+# Predictor operates on a single projected vector of width d_obj rather than
+# the full N_max * d_obj concatenation.
+type: graph
+capacity: matched
+width_mode: projected
+d_obj: 192
+n_max: 8

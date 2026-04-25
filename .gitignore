@@ -20,3 +20,4 @@ environment.json
 environment_v*.json
 requirements_frozen.txt
 requirements_frozen_v*.txt
+lightning_logs/

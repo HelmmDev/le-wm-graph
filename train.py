@@ -13,6 +13,7 @@ from omegaconf import OmegaConf, open_dict
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from data.bouncing_balls_transform import BouncingBallsGraphTransform
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -27,19 +28,27 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D)
+    emb = output["emb"]  # (B, T, D) flat or (B, T, N, D) graph
     act_emb = output["act_emb"]
+    emb_mask = output.get("emb_mask")  # (B, T, N) bool, only present for graph
 
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, : ctx_len]
+    ctx_mask = emb_mask[:, :ctx_len] if emb_mask is not None else None
 
     tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    pred_emb = self.model.predict(ctx_emb, ctx_act, mask=ctx_mask) # pred
 
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    if emb.ndim == 4:
+        # Graph variant: (B, T, N, D) → flatten N×D for byte-identical SIGReg
+        # math (per project plan §SIGReg). transpose to (T, B, N*D).
+        sigreg_input = emb.permute(1, 0, 2, 3).reshape(emb.size(1), emb.size(0), -1)
+    else:
+        sigreg_input = emb.transpose(0, 1)
+    output["sigreg_loss"] = self.sigreg(sigreg_input)
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
@@ -53,16 +62,44 @@ def run(cfg):
 
     dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
+
+    # Optional dataset-specific transform group (see config/train/data/*.yaml).
+    # Column normalizers run FIRST (on raw tensors with shapes matching the
+    # HDF5 stats) and the dataset transform runs LAST, so any pad/mask/inject
+    # operations don't have to worry about the normalizer's shape expectations.
+    data_transform_cfg = cfg.data.get("transform", None)
+    skip_normalize = set(
+        (data_transform_cfg or {}).get("skip_normalize", []) or []
+    )
+
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
 
+            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
+
+            if col in skip_normalize:
+                continue
+
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
 
-            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
+        # If the dataset has no `action` column (autonomous-physics envs like
+        # bouncing balls), the dataset transform will inject a zero
+        # placeholder of width `action_dim`. Mirror that here so the predictor
+        # builds the right-sized action_encoder.
+        if "action" not in cfg.data.dataset.keys_to_load:
+            if data_transform_cfg is not None and "bouncing_balls_graph" in data_transform_cfg:
+                cfg.wm.action_dim = int(data_transform_cfg.bouncing_balls_graph.action_dim)
+            elif "action_dim" not in cfg.wm:
+                cfg.wm.action_dim = 1
+
+    if data_transform_cfg is not None and "bouncing_balls_graph" in data_transform_cfg:
+        bb_kwargs = OmegaConf.to_container(
+            data_transform_cfg.bouncing_balls_graph, resolve=True
+        )
+        transforms.append(BouncingBallsGraphTransform(**bb_kwargs))
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
@@ -74,33 +111,86 @@ def run(cfg):
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
-    
+
     ##############################
     ##       model / optim      ##
     ##############################
 
-    encoder = spt.backbone.utils.vit_hf(
-        cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
+    # Encoder dispatch. The default (no `encoder` group, or encoder.type=='vit')
+    # preserves the original flat ViT path byte-identically. encoder.type='graph'
+    # selects the LeWM graph encoder built by Agent F (models/graph_encoder.py).
+    encoder_cfg = cfg.get("encoder", None)
+    encoder_type = (encoder_cfg.type if encoder_cfg is not None else "vit")
 
-    hidden_dim = encoder.config.hidden_size
-    embed_dim = cfg.wm.get("embed_dim", hidden_dim)
+    if encoder_type == "vit":
+        encoder = spt.backbone.utils.vit_hf(
+            (encoder_cfg.scale if encoder_cfg is not None else cfg.encoder_scale),
+            patch_size=(encoder_cfg.patch_size if encoder_cfg is not None else cfg.patch_size),
+            image_size=cfg.img_size,
+            pretrained=False,
+            use_mask_token=False,
+        )
+        hidden_dim = encoder.config.hidden_size
+        embed_dim = cfg.wm.get("embed_dim", hidden_dim)
+    elif encoder_type == "graph":
+        from models import GraphEncoder
+        encoder = GraphEncoder(
+            image_size=cfg.img_size,
+            d_obj=encoder_cfg.d_obj,
+            n_max=encoder_cfg.n_max,
+            capacity=encoder_cfg.capacity,
+            width_mode=encoder_cfg.width_mode,
+        )
+        # Per-token embed_dim. The graph encoder produces (B*T, N_max, d_obj)
+        # and the SetPredictor reshapes to (B, T*N_max, d_obj) with attention
+        # mask. Both `native` and `projected` width_modes operate per-token —
+        # `projected` adds an internal Linear(d_obj, 192) before output, so its
+        # per-token width is fixed at 192; `native` keeps per-token = d_obj.
+        # Width "widening" (per the ablation) only differs from baseline when
+        # d_obj > 192 in `native` mode.
+        if encoder_cfg.width_mode == "projected":
+            embed_dim = 192
+        elif encoder_cfg.width_mode == "native":
+            embed_dim = int(encoder_cfg.d_obj)
+        else:
+            raise ValueError(
+                f"Unknown encoder.width_mode={encoder_cfg.width_mode!r}; "
+                "expected 'native' or 'projected'."
+            )
+        with open_dict(cfg):
+            cfg.wm.embed_dim = embed_dim
+        # GraphEncoder produces predictor-ready embeddings; downstream MLPs
+        # below still expect a `hidden_dim`. Use embed_dim so the projector /
+        # predictor MLPs are dimension-preserving on the encoder output.
+        hidden_dim = embed_dim
+    else:
+        raise ValueError(
+            f"Unknown encoder.type={encoder_type!r}; expected 'vit' or 'graph'."
+        )
+
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
-    predictor = ARPredictor(
-        num_frames=cfg.wm.history_size,
-        input_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        output_dim=hidden_dim,
-        **cfg.predictor,
-    )
+    if encoder_type == "graph":
+        from models import SetPredictor
+        predictor = SetPredictor(
+            num_frames=cfg.wm.history_size,
+            input_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            n_max=encoder_cfg.n_max,
+            **cfg.predictor,
+        )
+    else:
+        predictor = ARPredictor(
+            num_frames=cfg.wm.history_size,
+            input_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            **cfg.predictor,
+        )
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
-    
+
     projector = MLP(
         input_dim=hidden_dim,
         output_dim=embed_dim,

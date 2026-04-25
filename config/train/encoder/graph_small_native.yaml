@@ -1,0 +1,6 @@
+# Graph encoder, small-capacity, native width.
+type: graph
+capacity: small
+width_mode: native
+d_obj: 192
+n_max: 8

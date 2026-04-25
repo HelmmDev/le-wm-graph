@@ -1,0 +1,6 @@
+# Graph encoder, small-capacity, projected width.
+type: graph
+capacity: small
+width_mode: projected
+d_obj: 192
+n_max: 8

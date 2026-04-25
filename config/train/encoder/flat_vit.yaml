@@ -1,0 +1,6 @@
+# Existing baseline: a flat ViT image encoder. Selecting this group makes the
+# train.py dispatch fall through to the original spt.backbone.utils.vit_hf path,
+# byte-identical to the pre-graph-encoder behavior.
+type: vit
+scale: tiny
+patch_size: 14

@@ -1,0 +1,31 @@
+# Bouncing balls is autonomous physics — there are no actions in the environment,
+# so we don't list `action` in keys_to_load. The bouncing-balls transform injects a
+# zero-valued (T, 1) `action` placeholder into each sample to satisfy the JEPA
+# action-conditioned predictor contract; train.py sets cfg.wm.action_dim=1
+# accordingly when the bouncing_balls dataset is selected.
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 1                          # bouncing balls dt is already 1/30; no extra skip needed
+  name: bouncing_balls_train
+  keys_to_load:
+    - pixels
+    - positions
+    - velocities                        # for state-vector ablation later
+  keys_to_cache:
+    - positions
+    - velocities
+
+# BouncingBallsGraphTransform handles positions normalization (box_size based,
+# not z-score) and pads positions/velocities from (T, 5, 2) to (T, 8, 2). The
+# train.py column-normalizer loop must skip these keys so its z-score stats
+# (computed from raw (T_total, 5, 2)) don't get applied to the post-transform
+# padded tensors.
+transform:
+  bouncing_balls_graph:
+    n_real: 5
+    n_max: 8
+    box_size: 64
+    action_dim: 1
+  skip_normalize:
+    - positions
+    - velocities
