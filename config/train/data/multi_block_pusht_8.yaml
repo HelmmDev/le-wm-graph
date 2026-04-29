@@ -1,0 +1,31 @@
+# Multi-block PushT, n_real=8 — see multi_block_pusht_2.yaml for full notes.
+# n_real == n_max here, so no padding actually occurs but the transform pipeline
+# still emits mask/target_mask for downstream uniformity.
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 1
+  name: multi_block_pusht_n8_train
+  keys_to_load:
+    - pixels
+    - action
+    - positions
+    - orientations
+    - target_positions
+    - target_orientations
+  keys_to_cache:
+    - positions
+    - orientations
+    - target_positions
+    - target_orientations
+
+transform:
+  multi_block_pusht_graph:
+    n_real: 8
+    n_max: 8
+    box_size: 224
+    action_dim: 2
+  skip_normalize:
+    - positions
+    - orientations
+    - target_positions
+    - target_orientations

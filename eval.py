@@ -86,7 +86,7 @@ def run(cfg: DictConfig):
 
     if policy != "random":
         model = swm.policy.AutoCostModel(cfg.policy)
-        model = model.to("cuda")
+        model = model.to(cfg.eval.get("device", "cuda"))
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True

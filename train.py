@@ -17,7 +17,18 @@ from data.bouncing_balls_transform import BouncingBallsGraphTransform
 
 
 def lejepa_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
+    """encode observations, predict next states, compute losses.
+
+    Loss masking (graph variant only):
+        For the graph encoder, absent slots are filled by the encoder with the
+        learned ``[ABSENT]`` embedding. We exclude those slots from the
+        prediction MSE using ``output["emb_mask"]`` (shape (B, T, N_max), bool)
+        so the model is not asked to "predict" a constant token. This keeps
+        the matched-conditions comparison cleaner: with N_real=5 / N_max=8,
+        ~37.5% of slots would otherwise contribute pure noise to the gradient
+        and dilute the meaningful signal. The flat ViT path is preserved
+        byte-identically (no mask available, plain ``.mean()`` reduction).
+    """
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
@@ -40,7 +51,19 @@ def lejepa_forward(self, batch, stage, cfg):
     pred_emb = self.model.predict(ctx_emb, ctx_act, mask=ctx_mask) # pred
 
     # LeWM loss
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+    if emb.ndim == 4:
+        # Graph variant: mask absent slots from pred_loss so the [ABSENT]
+        # embedding doesn't contribute (constant target = gradient noise +
+        # signal dilution). tgt_emb shape: (B, T_pred, N, D);
+        # emb_mask shape: (B, T, N) — slice to match tgt_emb's time range.
+        tgt_mask = emb_mask[:, n_preds:]  # (B, T_pred, N)
+        diff_sq = (pred_emb - tgt_emb).pow(2)  # (B, T_pred, N, D)
+        # Broadcast over the D dimension and average only over present slots.
+        mask_expanded = tgt_mask.unsqueeze(-1).expand_as(diff_sq).float()
+        output["pred_loss"] = (diff_sq * mask_expanded).sum() / (mask_expanded.sum() + 1e-8)
+    else:
+        # Flat path: unchanged byte-identical behavior.
+        output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     if emb.ndim == 4:
         # Graph variant: (B, T, N, D) → flatten N×D for byte-identical SIGReg
         # math (per project plan §SIGReg). transpose to (T, B, N*D).
